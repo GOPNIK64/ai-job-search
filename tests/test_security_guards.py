@@ -47,6 +47,37 @@ class GuardRepoFixture(unittest.TestCase):
         self.manifest.parent.mkdir(parents=True)
         self.write_manifest({"name": "example-cli", "scripts": {"start": "bun run src/cli.ts"}})
 
+        # Frontmatter grants: one core skill, one portal skill granting its own
+        # CLI, one command with no frontmatter at all. All pass as written.
+        self.core_skill = self.root / ".claude" / "skills" / "example" / "SKILL.md"
+        self.core_skill.parent.mkdir(parents=True)
+        self.write_skill(self.core_skill, "Read, Glob, Grep, WebFetch, Edit, Write")
+        self.portal_skill = self.root / ".agents" / "skills" / "example-search" / "SKILL.md"
+        self.write_skill(
+            self.portal_skill, "Bash(bun run .agents/skills/example-search/cli/src/cli.ts *)"
+        )
+        self.command = self.root / ".claude" / "commands" / "example.md"
+        self.command.parent.mkdir(parents=True)
+        self.command.write_text("# /example - A command with no frontmatter\n", encoding="utf-8")
+
+    def write_skill(self, path, allowed_tools, extra_frontmatter=""):
+        allowed = (
+            f"allowed-tools: {allowed_tools}\n"
+            if isinstance(allowed_tools, str)
+            else "allowed-tools:\n" + "".join(f"  - {t}\n" for t in allowed_tools)
+        )
+        path.write_text(
+            "---\n"
+            f"name: {path.parent.name}\n"
+            "description: >\n"
+            "  Folded description line one,\n"
+            "  line two mentions Bash, Edit, Write on purpose.\n"
+            f"{extra_frontmatter}"
+            f"{allowed}"
+            "---\n\n# Body\n",
+            encoding="utf-8",
+        )
+
     def write_settings(self, allow, ask=None, deny=None):
         permissions = {
             "allow": list(allow),
@@ -168,6 +199,101 @@ class AskDenyRuleTests(GuardRepoFixture):
                 self.assertEqual(result.returncode, 1)
                 self.assertIn(message, result.stdout)
                 self.assertNotIn("Traceback", result.stderr)
+
+
+class SkillGrantGuardTests(GuardRepoFixture):
+    """A skill's or command's allowed-tools pre-approves those tools for the turn
+    that invokes it, with no prompt, in untrusted folders too. settings.json is
+    allowlisted; this holds the frontmatter to the same bar."""
+
+    def test_bare_bash_in_skill_fails(self):
+        self.write_skill(self.core_skill, "Read, Bash, Edit")
+        result = run_guards(self.root)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("allowed-tools entry not in the reviewed allowlist", result.stdout)
+        self.assertIn("'Bash'", result.stdout)
+        self.assertIn(".claude/skills/example/SKILL.md", result.stdout.replace("\\", "/"))
+
+    def test_glob_cli_grant_in_skill_fails(self):
+        self.write_skill(self.core_skill, "Read, Bash(bun run .agents/skills/*/cli/src/cli.ts *)")
+        result = run_guards(self.root)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("wildcard", result.stdout)
+        self.assertIn(".agents/skills/*/cli/src/cli.ts", result.stdout)
+
+    def test_portal_skill_may_grant_only_its_own_cli(self):
+        for own in (
+            "Bash(bun run .agents/skills/example-search/cli/src/cli.ts *)",
+            "Bash(bun run .agents/skills/example-search/cli/src/cli.ts:*)",
+        ):
+            with self.subTest(own=own):
+                self.write_skill(self.portal_skill, own)
+                result = run_guards(self.root)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.write_skill(
+            self.portal_skill, "Bash(bun run .agents/skills/other-search/cli/src/cli.ts *)"
+        )
+        result = run_guards(self.root)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("other-search", result.stdout)
+
+    def test_core_skill_may_not_grant_a_portal_cli(self):
+        # Per-portal grants live in settings.json; a core skill naming one would
+        # hardcode a portal and bypass the settings allowlist.
+        self.write_skill(
+            self.core_skill, "Bash(bun run .agents/skills/example-search/cli/src/cli.ts *)"
+        )
+        result = run_guards(self.root)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("allowed-tools entry not in the reviewed allowlist", result.stdout)
+
+    def test_command_frontmatter_is_checked(self):
+        self.command.write_text(
+            "---\ndescription: Example\nallowed-tools: Bash\n---\n# /example\n", encoding="utf-8"
+        )
+        result = run_guards(self.root)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("'Bash'", result.stdout)
+        self.assertIn("commands/example.md", result.stdout.replace("\\", "/"))
+
+    def test_command_without_frontmatter_passes(self):
+        result = run_guards(self.root)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_list_form_allowed_tools_is_parsed(self):
+        self.write_skill(self.core_skill, ["Read", "Grep", "Bash"])
+        result = run_guards(self.root)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("'Bash'", result.stdout)
+
+    def test_folded_description_does_not_confuse_parser(self):
+        # The fixture's description folds across lines that mention Bash, Edit,
+        # Write. Only the allowed-tools line counts.
+        self.write_skill(self.core_skill, "Read")
+        result = run_guards(self.root)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_entry_with_mid_pattern_wildcard_fails(self):
+        self.write_skill(self.core_skill, "Read, Bash(python tools/*.py:*)")
+        result = run_guards(self.root)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("wildcard", result.stdout)
+
+    def test_allowlisted_shipped_entries_pass(self):
+        self.write_skill(
+            self.core_skill,
+            "Read, Write, Edit, Glob, Grep, Bash(bun --version), Bash(python tools/job_key.py:*), "
+            "Bash(python3 tools/job_key.py:*), WebFetch, WebSearch, Agent, AskUserQuestion",
+        )
+        result = run_guards(self.root)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_skill_without_frontmatter_fails_cleanly(self):
+        self.core_skill.write_text("# No frontmatter\n", encoding="utf-8")
+        result = run_guards(self.root)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("frontmatter", result.stdout)
+        self.assertNotIn("Traceback", result.stderr)
 
 
 class HookGuardTests(GuardRepoFixture):

@@ -28,6 +28,7 @@ Stdlib only. Exit 0 on success, 1 with a failure list otherwise.
 """
 
 import json
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -196,6 +197,145 @@ ALLOWED_IGNORE_NEGATIONS = {
 ALLOWED_HOOKS: set[str] = set()
 
 FORBIDDEN_SCRIPTS = {"preinstall", "install", "postinstall", "prepare", "prepack"}
+
+# The exact `allowed-tools` entries a skill or command frontmatter may carry.
+# Claude Code pre-approves these for the turn that invokes the skill, with no
+# prompt, and workspace trust never gates it - so the frontmatter is a second
+# permission allowlist and is held to the same bar as settings.json. Tool-level
+# entries only: path-scoped Read/Edit rules live in settings.json, and every
+# Bash the skills document is allowlisted per command there. A portal skill
+# under .agents/skills/<name>/ may additionally grant exactly its own CLI
+# (checked structurally below, so no portal name appears here).
+ALLOWED_SKILL_TOOLS = {
+    "Read",
+    "Glob",
+    "Grep",
+    "WebFetch",
+    "WebSearch",
+    "Edit",
+    "Write",
+    "AskUserQuestion",
+    "Agent",
+    "Bash(bun --version)",
+    "Bash(python tools/job_key.py:*)",
+    "Bash(python3 tools/job_key.py:*)",
+}
+
+_FRONTMATTER_KEY = re.compile(r"^([A-Za-z0-9_-]+):\s*(.*)$")
+
+
+def _frontmatter(text: str):
+    """Parse the YAML-ish frontmatter the repo's skills use, stdlib only.
+
+    Returns a dict, or None when the file has no frontmatter. Handles
+    `key: value`, folded/literal scalars (`key: >` / `key: |` followed by
+    indented lines), and `key:` followed by `- item` lines. Indented lines
+    never start a key, so a folded description mentioning "Bash" cannot be
+    mistaken for a grant. Anything fancier than that is not used here, and
+    an unrecognised shape surfaces as a missing key rather than a crash.
+    """
+    if not text.startswith("---"):
+        return None
+    lines = text.splitlines()
+    end = next((i for i in range(1, len(lines)) if lines[i].strip() == "---"), None)
+    if end is None:
+        return None
+    data: dict = {}
+    key = None
+    for raw in lines[1:end]:
+        if raw[:1] in (" ", "\t"):
+            if key is None:
+                continue
+            stripped = raw.strip()
+            if stripped.startswith("- "):
+                if not isinstance(data[key], list):
+                    data[key] = []
+                data[key].append(stripped[2:].strip())
+            elif isinstance(data[key], str):
+                data[key] = (data[key] + " " + stripped).strip()
+            continue
+        match = _FRONTMATTER_KEY.match(raw)
+        if not match:
+            key = None
+            continue
+        key, value = match.group(1), match.group(2).strip()
+        data[key] = "" if value in (">", "|", ">-", "|-") else value
+    return data
+
+
+def _tool_entries(value) -> list:
+    """Split an `allowed-tools` value into entries (string or list form)."""
+    if isinstance(value, list):
+        return [str(item).strip() for item in value if str(item).strip()]
+    if not isinstance(value, str):
+        return []
+    entries, depth, current = [], 0, []
+    for char in value:
+        if char == "(":
+            depth += 1
+        elif char == ")":
+            depth = max(depth - 1, 0)
+        if char == "," and depth == 0:
+            entries.append("".join(current).strip())
+            current = []
+        else:
+            current.append(char)
+    entries.append("".join(current).strip())
+    return [entry for entry in entries if entry]
+
+
+def _own_cli_grant(path: Path) -> set:
+    """The two spellings of 'this portal skill may run its own CLI'."""
+    try:
+        rel = path.relative_to(ROOT).as_posix()
+    except ValueError:
+        return set()
+    parts = rel.split("/")
+    if len(parts) == 4 and parts[:2] == [".agents", "skills"] and parts[3] == "SKILL.md":
+        cli = f"bun run .agents/skills/{parts[2]}/cli/src/cli.ts"
+        return {f"Bash({cli} *)", f"Bash({cli}:*)"}
+    return set()
+
+
+def check_skill_tool_grants() -> None:
+    skills = sorted(ROOT.glob(".claude/skills/*/SKILL.md")) + sorted(
+        ROOT.glob(".agents/skills/*/SKILL.md")
+    )
+    commands = sorted((ROOT / ".claude" / "commands").glob("*.md"))
+    for path in skills + commands:
+        rel = path.relative_to(ROOT).as_posix()
+        try:
+            data = _frontmatter(path.read_text(encoding="utf-8"))
+        except OSError as exc:
+            errors.append(f"{rel}: unreadable: {exc}")
+            continue
+        if data is None:
+            if path in commands:
+                continue  # commands may omit frontmatter entirely
+            errors.append(f"{rel}: missing or unterminated frontmatter (expected --- ... ---)")
+            continue
+        permitted = ALLOWED_SKILL_TOOLS | _own_cli_grant(path)
+        for entry in _tool_entries(data.get("allowed-tools", "")):
+            if entry in permitted:
+                continue
+            if "*" in entry and not (
+                entry.endswith((" *)", ":*)")) and "*" not in entry[:-2]
+            ):
+                errors.append(
+                    f"{rel}: allowed-tools entry uses a wildcard inside the pattern: "
+                    f"{entry!r}. A glob here pre-approves whatever lands at that path, "
+                    "including code added later; name the exact command instead."
+                )
+                continue
+            errors.append(
+                f"{rel}: allowed-tools entry not in the reviewed allowlist: {entry!r}. "
+                "Claude Code pre-approves allowed-tools for the turn that invokes the "
+                "skill, with no prompt and regardless of workspace trust, so this line is "
+                "a permission allowlist like settings.json. Bare Bash means any command. "
+                "If the grant is intentional, add it to ALLOWED_SKILL_TOOLS in "
+                "tools/security_guards.py in the same PR; a portal skill may grant only "
+                "its own .agents/skills/<name>/cli/src/cli.ts."
+            )
 
 
 def _hook_commands(event: str, entries: object):
@@ -386,6 +526,7 @@ def main() -> int:
     check_gitignore()
     check_package_manifests()
     check_tracked_node_modules()
+    check_skill_tool_grants()
     if errors:
         print(f"security_guards: {len(errors)} failure(s)")
         for err in errors:
@@ -393,7 +534,7 @@ def main() -> int:
         return 1
     print(
         "security_guards: OK (permissions allowlist, hooks allowlist, gitignore rules, "
-        "package manifests, no tracked node_modules)"
+        "package manifests, no tracked node_modules, skill/command allowed-tools)"
     )
     return 0
 
