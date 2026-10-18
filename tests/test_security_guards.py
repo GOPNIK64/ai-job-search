@@ -183,8 +183,16 @@ class AskDenyRuleTests(GuardRepoFixture):
         self.assertIn("Read(.env)", security_guards.REQUIRED_DENY_RULES)
         self.assertIn("Read(~/.ssh/**)", security_guards.REQUIRED_DENY_RULES)
         self.assertIn("Bash(ssh:*)", security_guards.REQUIRED_DENY_RULES)
+        # The obvious siblings of the listed upload shapes.
+        for sibling in ("Bash(curl -XPOST:*)", "Bash(curl --request POST:*)", "Bash(wget --method=POST:*)"):
+            self.assertIn(sibling, security_guards.REQUIRED_DENY_RULES)
         self.assertIn("Edit(.claude/settings.json)", security_guards.REQUIRED_ASK_RULES)
         self.assertIn("Edit(.claude/skills/*/SKILL.md)", security_guards.REQUIRED_ASK_RULES)
+        # A command's frontmatter is a grant too (check 4 parses it), so writing
+        # one must prompt - otherwise a steered session could add
+        # `allowed-tools: Bash` to apply.md with no prompt and the next /apply
+        # would be pre-approved for bare Bash.
+        self.assertIn("Edit(.claude/commands/*.md)", security_guards.REQUIRED_ASK_RULES)
         self.assertIn("Bash(git push:*)", security_guards.REQUIRED_ASK_RULES)
 
     def test_malformed_ask_or_deny_shape_fails_cleanly(self):
@@ -236,6 +244,39 @@ class SkillGrantGuardTests(GuardRepoFixture):
         result = run_guards(self.root)
         self.assertEqual(result.returncode, 1)
         self.assertIn("other-search", result.stdout)
+
+    def test_portal_skill_may_not_grant_core_tools(self):
+        # SECURITY.md promises "exactly that portal's own cli/src/cli.ts and
+        # nothing else"; the guard has to make that true.
+        self.write_skill(
+            self.portal_skill,
+            "Read, Edit, Bash(bun run .agents/skills/example-search/cli/src/cli.ts *)",
+        )
+        result = run_guards(self.root)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("'Edit'", result.stdout)
+
+    def test_bom_prefixed_frontmatter_is_parsed(self):
+        # Windows editors prepend a BOM; the file must parse, not fail as
+        # "missing frontmatter".
+        self.write_skill(self.core_skill, "Read")
+        self.core_skill.write_bytes(b"\xef\xbb\xbf" + self.core_skill.read_bytes())
+        result = run_guards(self.root)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_non_utf8_skill_fails_cleanly(self):
+        self.core_skill.write_bytes(b"---\nname: x\nallowed-tools: Read\ndescription: caf\xe9\n---\n")
+        result = run_guards(self.root)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("unreadable", result.stdout)
+        self.assertNotIn("Traceback", result.stderr)
+
+    def test_flow_list_allowed_tools_is_parsed(self):
+        self.write_skill(self.core_skill, "[Read, Grep, Bash]")
+        result = run_guards(self.root)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("'Bash'", result.stdout)
+        self.assertNotIn("'[Read'", result.stdout)
 
     def test_core_skill_may_not_grant_a_portal_cli(self):
         # Per-portal grants live in settings.json; a core skill naming one would

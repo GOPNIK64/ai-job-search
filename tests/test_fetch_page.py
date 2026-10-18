@@ -40,6 +40,17 @@ class _Handler(http.server.BaseHTTPRequestHandler):
         elif self.path == "/forbidden":
             body = b"<html><body>denied</body></html>"
             self.send_response(403)
+        elif self.path in ("/loop1", "/loop2"):
+            self.send_response(302)
+            self.send_header("Location", "/loop2" if self.path == "/loop1" else "/loop1")
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
+        elif self.path == "/gzip-big":
+            import gzip as _gzip
+            body = _gzip.compress(b"<p>" + b"x" * 5000 + b"</p>")
+            self.send_response(200)
+            self.send_header("Content-Encoding", "gzip")
         else:
             body = b"nope"
             self.send_response(404)
@@ -158,6 +169,34 @@ class Fetching(FetchPageFixture):
         self.assertTrue(saved.exists())
         with self.assertRaises(ValueError):
             saved.resolve().relative_to(REPO_ROOT)
+
+    def _without_curl(self):
+        orig_which = fetch_page.shutil.which
+        fetch_page.shutil.which = lambda name: None
+        self.addCleanup(setattr, fetch_page.shutil, "which", orig_which)
+
+    def test_redirect_loop_is_a_transport_error_on_both_paths(self):
+        # The docstring promises "5 redirects"; a loop must end in exit 2 with
+        # nothing claimed as fetched, with or without curl installed.
+        for label in ("curl", "urllib"):
+            with self.subTest(path=label):
+                if label == "urllib":
+                    self._without_curl()
+                code, out, err = self.run_main(f"{self.base}/loop1", "--out", str(self.out))
+                self.assertEqual(code, 2, out + err)
+                self.assertNotIn("saved=", out)
+
+    def test_decompressed_size_is_bounded_on_urllib_path(self):
+        # The 10 MB cap must apply after Content-Encoding is undone, or a small
+        # gzip body can expand past it. MAX_BYTES is lowered to make it testable.
+        self._without_curl()
+        orig_max = fetch_page.MAX_BYTES
+        fetch_page.MAX_BYTES = 1000
+        self.addCleanup(setattr, fetch_page, "MAX_BYTES", orig_max)
+        code, out, err = self.run_main(f"{self.base}/gzip-big", "--out", str(self.out))
+        self.assertEqual(code, 2, out + err)
+        self.assertIn("exceeds", err)
+        self.assertFalse(self.out.exists())
 
     def test_urllib_fallback_when_curl_missing(self):
         orig_which = fetch_page.shutil.which

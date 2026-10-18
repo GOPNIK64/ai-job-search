@@ -23,6 +23,14 @@ Checks:
 3. .agents/**/package.json — no npm/bun lifecycle scripts (preinstall,
    install, postinstall, prepare, prepack) and no trustedDependencies.
    Catches code execution smuggled into `bun install`.
+4. Skill and command frontmatter — every `allowed-tools` entry in
+   .claude/skills/*/SKILL.md, .agents/skills/*/SKILL.md and
+   .claude/commands/*.md must be in ALLOWED_SKILL_TOOLS (a portal skill may
+   instead grant exactly its own CLI). Claude Code pre-approves these for the
+   turn that invokes the skill, with no prompt, regardless of workspace trust,
+   so the frontmatter is a second permission allowlist. Catches bare Bash and
+   glob grants. The settings.json `ask` and `deny` lists are also required to
+   keep every rule in REQUIRED_ASK_RULES / REQUIRED_DENY_RULES.
 
 Stdlib only. Exit 0 on success, 1 with a failure list otherwise.
 """
@@ -81,6 +89,8 @@ REQUIRED_ASK_RULES = [
     "Edit(.claude/settings.json)",
     "Edit(.claude/settings.local.json)",
     "Edit(.claude/skills/*/SKILL.md)",
+    # A command's frontmatter may carry allowed-tools too (check 4 reads it).
+    "Edit(.claude/commands/*.md)",
     "Edit(.claude/agents/**)",
     "Edit(.github/**)",
     "Edit(tools/security_guards.py)",
@@ -108,8 +118,11 @@ REQUIRED_DENY_RULES = [
     "Bash(curl --upload-file:*)",
     "Bash(curl -X POST:*)",
     "Bash(curl -X PUT:*)",
+    "Bash(curl -XPOST:*)",
+    "Bash(curl --request POST:*)",
     "Bash(wget --post-data:*)",
     "Bash(wget --post-file:*)",
+    "Bash(wget --method=POST:*)",
     "Bash(scp:*)",
     "Bash(sftp:*)",
     "Bash(ssh:*)",
@@ -234,6 +247,7 @@ def _frontmatter(text: str):
     mistaken for a grant. Anything fancier than that is not used here, and
     an unrecognised shape surfaces as a missing key rather than a crash.
     """
+    text = text.lstrip("﻿")  # a BOM from a Windows editor is not content
     if not text.startswith("---"):
         return None
     lines = text.splitlines()
@@ -269,6 +283,9 @@ def _tool_entries(value) -> list:
         return [str(item).strip() for item in value if str(item).strip()]
     if not isinstance(value, str):
         return []
+    value = value.strip()
+    if value.startswith("[") and value.endswith("]"):  # YAML flow list
+        value = value[1:-1]
     entries, depth, current = [], 0, []
     for char in value:
         if char == "(":
@@ -306,15 +323,18 @@ def check_skill_tool_grants() -> None:
         rel = path.relative_to(ROOT).as_posix()
         try:
             data = _frontmatter(path.read_text(encoding="utf-8"))
-        except OSError as exc:
-            errors.append(f"{rel}: unreadable: {exc}")
+        except (OSError, UnicodeDecodeError) as exc:
+            errors.append(f"{rel}: unreadable (must be UTF-8): {exc}")
             continue
         if data is None:
             if path in commands:
                 continue  # commands may omit frontmatter entirely
             errors.append(f"{rel}: missing or unterminated frontmatter (expected --- ... ---)")
             continue
-        permitted = ALLOWED_SKILL_TOOLS | _own_cli_grant(path)
+        # A portal skill may grant exactly its own CLI and nothing else - that is
+        # the promise SECURITY.md makes, and portals are leaving the tree anyway.
+        own_cli = _own_cli_grant(path)
+        permitted = own_cli if own_cli else ALLOWED_SKILL_TOOLS
         for entry in _tool_entries(data.get("allowed-tools", "")):
             if entry in permitted:
                 continue

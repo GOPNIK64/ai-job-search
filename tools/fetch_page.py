@@ -21,7 +21,8 @@ Properties, each pinned by tests/test_fetch_page.py:
     that said no.
   * Fetched content never lands in the repo. --out defaults to the system temp
     directory and a path that resolves inside the repo root is refused.
-  * Bounded: 45 s, 5 redirects, 10 MB.
+  * Bounded: 45 s, 5 redirects, 10 MB - on both the curl and the urllib path,
+    and the size cap is applied after Content-Encoding is undone.
 
 Usage:
   python3 tools/fetch_page.py <url> [--out PATH] [--text] [--max-chars N]
@@ -49,7 +50,7 @@ import zlib
 from pathlib import Path
 from urllib.error import HTTPError
 from urllib.parse import urlsplit
-from urllib.request import Request, urlopen
+from urllib.request import HTTPRedirectHandler, Request, build_opener
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from robots_check import BROWSER, gate  # noqa: E402
@@ -90,8 +91,13 @@ def fetch_with_curl(url: str, out: Path) -> str:
     return proc.stdout.strip()
 
 
+class _BoundedRedirects(HTTPRedirectHandler):
+    """urllib's default is 10 hops; match curl's --max-redirs."""
+    max_redirections = MAX_REDIRECTS
+
+
 def fetch_with_urllib(url: str, out: Path) -> str:
-    """Fallback for machines without curl. Same headers, gzip/deflate only."""
+    """Fallback for machines without curl. Same headers and bounds, gzip/deflate only."""
     request = Request(url, headers={
         "User-Agent": BROWSER,
         "Accept": ACCEPT,
@@ -99,8 +105,12 @@ def fetch_with_urllib(url: str, out: Path) -> str:
         "Accept-Encoding": "gzip, deflate",
     })
     try:
-        response = urlopen(request, timeout=TIMEOUT_SECONDS)  # noqa: S310 (scheme checked in main)
+        response = build_opener(_BoundedRedirects()).open(request, timeout=TIMEOUT_SECONDS)  # noqa: S310
     except HTTPError as exc:
+        if 300 <= exc.code < 400:
+            # Redirects are followed transparently; a 3xx surfacing here means
+            # the hop limit was hit (urllib reports a loop this way).
+            raise RuntimeError(f"more than {MAX_REDIRECTS} redirects") from exc
         response = exc
     with response:
         code = response.status if hasattr(response, "status") else response.code
@@ -112,6 +122,8 @@ def fetch_with_urllib(url: str, out: Path) -> str:
         body = gzip.decompress(body)
     elif encoding == "deflate":
         body = zlib.decompress(body, -zlib.MAX_WBITS)
+    if len(body) > MAX_BYTES:
+        raise RuntimeError(f"response exceeds {MAX_BYTES} bytes after decompression")
     out.write_bytes(body)
     return f"HTTP {code} size={len(body)}"
 

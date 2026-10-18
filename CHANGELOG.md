@@ -507,11 +507,14 @@ per-file diff commands.
   regardless of workspace trust. The job-application skill granted `Bash`, `Edit`, `Write`
   outright, and the scraper granted `bun run` on any `.agents/skills/*/cli/src/cli.ts`, while
   `.claude/settings.json` carefully enumerated six portals - a public review by an AI agent
-  (shared on Reddit) read exactly that and concluded local use was unsafe as configured. Every
-  Bash command the skills document was already allowlisted per command in `settings.json`, so
-  the bare grant bought nothing but exposure. The per-portal grants stay in `settings.json`;
-  `/add-portal` now says a new portal is pre-approved only once its own entry is there and in
-  `ALLOWED_PERMISSIONS`. In default mode the documented workflow gains no new prompt.
+  (shared on Reddit) read exactly that and concluded local use was unsafe as configured. The
+  tools scripts, salary lookup, `pdftotext` and the portal CLIs were already allowlisted per
+  command in `settings.json`, so no new standing grant is needed. What the bare grant did cover,
+  in a turn where the skill fired, was compile (`lualatex`/`xelatex`) and the `rm -f` of build
+  intermediates; those now prompt in default mode, as the SECURITY.md table says - a
+  `lualatex:*` grant would also approve `-shell-escape`, so they are deliberately not
+  pre-approved. The per-portal grants stay in `settings.json`; `/add-portal` now says a new
+  portal is pre-approved only once its own entry is there and in `ALLOWED_PERMISSIONS`.
 
 - **`.claude/settings.json` ships `ask` and `deny` rules, and the guard requires them**
   (`tools/security_guards.py` `REQUIRED_ASK_RULES` / `REQUIRED_DENY_RULES`,
