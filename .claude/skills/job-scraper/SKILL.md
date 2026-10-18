@@ -105,7 +105,7 @@ ghost report self-triaging. `isActive: true` is only the absence of that banner,
 proof the posting is open; deadlines and dead URLs remain `/rank`'s job.
 
 **From WebSearch results:** Use `WebFetch` on the posting URL and extract the same
-fields manually. If it returns HTTP 403, retry with browser headers via curl per
+fields manually. If it returns HTTP 403, retry with browser headers via `python3 tools/fetch_page.py` per
 `.claude/skills/job-application-assistant/09-web-research.md` before giving up — most
 bank and corporate sites reject WebFetch's user agent while serving browsers normally.
 
