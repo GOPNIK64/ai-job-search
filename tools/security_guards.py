@@ -61,7 +61,61 @@ ALLOWED_PERMISSIONS = {
     "Bash(python tools/verify_layout.py:*)",
     "Bash(python3 tools/verify_layout.py:*)",
     "Bash(pdftotext:*)",
+    # The browser-header retry in 09-web-research.md. fetch_page.py is GET-only
+    # with a fixed argv and refuses to write inside the repo, which is why the
+    # grant names the script and not `curl`.
+    "Bash(python tools/robots_check.py:*)",
+    "Bash(python3 tools/robots_check.py:*)",
+    "Bash(python tools/fetch_page.py:*)",
+    "Bash(python3 tools/fetch_page.py:*)",
 }
+
+# Rules that must stay in .claude/settings.json permissions.ask. An ask rule
+# forces a prompt even when an allow rule or a skill's allowed-tools grant
+# would otherwise pre-approve the call. These are the files whose content IS
+# the permission surface: a session that could edit them silently could widen
+# its own grants. Plus the one outbound git action. Extra ask rules are fine;
+# removing one of these fails.
+REQUIRED_ASK_RULES = [
+    "Edit(.claude/settings.json)",
+    "Edit(.claude/settings.local.json)",
+    "Edit(.claude/skills/*/SKILL.md)",
+    "Edit(.claude/agents/**)",
+    "Edit(.github/**)",
+    "Edit(tools/security_guards.py)",
+    "Bash(git push:*)",
+]
+
+# Rules that must stay in .claude/settings.json permissions.deny. A deny rule
+# blocks in every permission mode, bypassPermissions included, and overrides
+# any allow rule or skill grant. Two groups: shell that uploads data or opens a
+# remote shell (nothing in the workflow does either), and reads of credential
+# stores (Read denies also cover Bash cat/head/tail/sed on the path). Prefix
+# rules are tripwires, not walls: `curl -sS -d` is not caught by `curl -d`.
+# SECURITY.md says so. Extra deny rules are fine; removing one of these fails.
+REQUIRED_DENY_RULES = [
+    "Read(.env)",
+    "Read(.env.*)",
+    "Read(~/.ssh/**)",
+    "Read(~/.aws/**)",
+    "Read(~/.gnupg/**)",
+    "Bash(curl -d:*)",
+    "Bash(curl --data:*)",
+    "Bash(curl -F:*)",
+    "Bash(curl --form:*)",
+    "Bash(curl -T:*)",
+    "Bash(curl --upload-file:*)",
+    "Bash(curl -X POST:*)",
+    "Bash(curl -X PUT:*)",
+    "Bash(wget --post-data:*)",
+    "Bash(wget --post-file:*)",
+    "Bash(scp:*)",
+    "Bash(sftp:*)",
+    "Bash(ssh:*)",
+    "Bash(nc:*)",
+    "Bash(ncat:*)",
+    "Bash(netcat:*)",
+]
 
 # Personal-data ignore rules that must never disappear from .gitignore.
 REQUIRED_IGNORE_RULES = [
@@ -218,6 +272,25 @@ def check_permissions() -> None:
         # Not an error: settings may legitimately drop an entry. But an
         # allowlist entry that no longer exists should be pruned.
         print(f"note: allowlisted permission not present in settings.json: {entry!r}")
+
+    for key, required, effect in (
+        ("ask", REQUIRED_ASK_RULES, "an ask rule forces a prompt even over a skill grant"),
+        ("deny", REQUIRED_DENY_RULES, "a deny rule blocks in every mode, bypass included"),
+    ):
+        rules = permissions.get(key, [])
+        if not isinstance(rules, list) or not all(isinstance(entry, str) for entry in rules):
+            errors.append(f".claude/settings.json: permissions.{key} must be a list of strings")
+            continue
+        present = set(rules)
+        for rule in required:
+            if rule not in present:
+                errors.append(
+                    f".claude/settings.json: required {key} rule missing: {rule!r}. "
+                    f"Removing it silently re-opens what it closed ({effect}). If the "
+                    f"change is intentional, update REQUIRED_{key.upper()}_RULES in "
+                    "tools/security_guards.py in the same PR so the widening is explicit "
+                    "and reviewable."
+                )
 
 
 def check_gitignore() -> None:

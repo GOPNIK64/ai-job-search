@@ -47,8 +47,13 @@ class GuardRepoFixture(unittest.TestCase):
         self.manifest.parent.mkdir(parents=True)
         self.write_manifest({"name": "example-cli", "scripts": {"start": "bun run src/cli.ts"}})
 
-    def write_settings(self, allow):
-        self.settings.write_text(json.dumps({"permissions": {"allow": list(allow)}}))
+    def write_settings(self, allow, ask=None, deny=None):
+        permissions = {
+            "allow": list(allow),
+            "ask": list(security_guards.REQUIRED_ASK_RULES if ask is None else ask),
+            "deny": list(security_guards.REQUIRED_DENY_RULES if deny is None else deny),
+        }
+        self.settings.write_text(json.dumps({"permissions": permissions}))
 
     def write_gitignore(self, rules):
         self.gitignore.write_text("\n".join(rules) + "\n")
@@ -107,6 +112,64 @@ class PermissionGuardTests(GuardRepoFixture):
                 self.assertNotIn("Traceback", result.stderr)
 
 
+class AskDenyRuleTests(GuardRepoFixture):
+    """settings.json ships deny rules (block in every mode, bypass included) and
+    ask rules (always prompt, even over a skill's allowed-tools grant). Removing
+    one silently re-opens the hole it closed, so each is required, like the
+    personal-data gitignore rules."""
+
+    def test_missing_required_deny_rule_fails(self):
+        deny = list(security_guards.REQUIRED_DENY_RULES)
+        dropped = deny.pop()
+        self.write_settings(sorted(security_guards.ALLOWED_PERMISSIONS), deny=deny)
+        result = run_guards(self.root)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("required deny rule missing", result.stdout)
+        self.assertIn(dropped, result.stdout)
+
+    def test_missing_required_ask_rule_fails(self):
+        ask = list(security_guards.REQUIRED_ASK_RULES)
+        dropped = ask.pop(0)
+        self.write_settings(sorted(security_guards.ALLOWED_PERMISSIONS), ask=ask)
+        result = run_guards(self.root)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("required ask rule missing", result.stdout)
+        self.assertIn(dropped, result.stdout)
+
+    def test_extra_deny_and_ask_rules_pass(self):
+        # Narrowing further is always fine; only removal is guarded.
+        self.write_settings(
+            sorted(security_guards.ALLOWED_PERMISSIONS),
+            ask=list(security_guards.REQUIRED_ASK_RULES) + ["Bash(git commit:*)"],
+            deny=list(security_guards.REQUIRED_DENY_RULES) + ["WebFetch(domain:pastebin.com)"],
+        )
+        result = run_guards(self.root)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_required_rules_are_the_shipped_shapes(self):
+        # The constants are the contract SECURITY.md describes; pin the two
+        # groups that matter most so a rename cannot quietly drop them.
+        self.assertIn("Read(.env)", security_guards.REQUIRED_DENY_RULES)
+        self.assertIn("Read(~/.ssh/**)", security_guards.REQUIRED_DENY_RULES)
+        self.assertIn("Bash(ssh:*)", security_guards.REQUIRED_DENY_RULES)
+        self.assertIn("Edit(.claude/settings.json)", security_guards.REQUIRED_ASK_RULES)
+        self.assertIn("Edit(.claude/skills/*/SKILL.md)", security_guards.REQUIRED_ASK_RULES)
+        self.assertIn("Bash(git push:*)", security_guards.REQUIRED_ASK_RULES)
+
+    def test_malformed_ask_or_deny_shape_fails_cleanly(self):
+        for permissions, message in [
+            ({"allow": [], "deny": "Bash(ssh:*)"}, "permissions.deny must be a list of strings"),
+            ({"allow": [], "ask": [1]}, "permissions.ask must be a list of strings"),
+            ({"allow": []}, "required deny rule missing"),
+        ]:
+            with self.subTest(permissions=permissions):
+                self.settings.write_text(json.dumps({"permissions": permissions}))
+                result = run_guards(self.root)
+                self.assertEqual(result.returncode, 1)
+                self.assertIn(message, result.stdout)
+                self.assertNotIn("Traceback", result.stderr)
+
+
 class HookGuardTests(GuardRepoFixture):
     """A hook in .claude/settings.json runs with no prompt when its event fires.
 
@@ -119,7 +182,11 @@ class HookGuardTests(GuardRepoFixture):
         self.settings.write_text(
             json.dumps(
                 {
-                    "permissions": {"allow": sorted(security_guards.ALLOWED_PERMISSIONS)},
+                    "permissions": {
+                        "allow": sorted(security_guards.ALLOWED_PERMISSIONS),
+                        "ask": list(security_guards.REQUIRED_ASK_RULES),
+                        "deny": list(security_guards.REQUIRED_DENY_RULES),
+                    },
                     "hooks": hooks,
                 }
             )
